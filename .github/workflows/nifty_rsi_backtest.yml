@@ -58,127 +58,70 @@ jobs:
 
           m=pd.concat(frames, ignore_index=True).drop_duplicates('dt').sort_values('dt').reset_index(drop=True)
           m=m[(m.dt.dt.year>=2012)&(m.dt.dt.year<=2023)]
-
-          # Build exchange-session 60-minute candles anchored at 09:15.
           m['session_date']=m.dt.dt.date
           m['mins']=(m.dt.dt.hour*60+m.dt.dt.minute)-555
           m=m[(m.mins>=0)&(m.mins<=375)]
           m['bucket']=(m.mins//60).astype(int)
           h=(m.groupby(['session_date','bucket'], sort=True)
                .agg(dt=('dt','max'), open=('open','first'), high=('high','max'), low=('low','min'), close=('close','last'), n=('close','size'))
-               .reset_index())
-          # Keep complete-ish hourly buckets; the final partial session bucket is valid as a candle.
-          h=h.sort_values('dt').reset_index(drop=True)
+               .reset_index().sort_values('dt').reset_index(drop=True))
 
-          # Wilder RSI(14), seeded with the first 14-change SMA.
-          delta=h.close.diff()
-          gain=delta.clip(lower=0)
-          loss=(-delta.clip(upper=0))
-          avg_gain=pd.Series(np.nan,index=h.index,dtype=float)
-          avg_loss=pd.Series(np.nan,index=h.index,dtype=float)
+          delta=h.close.diff(); gain=delta.clip(lower=0); loss=(-delta.clip(upper=0))
+          avg_gain=pd.Series(np.nan,index=h.index,dtype=float); avg_loss=pd.Series(np.nan,index=h.index,dtype=float)
           if len(h)>14:
-              avg_gain.iloc[14]=gain.iloc[1:15].mean()
-              avg_loss.iloc[14]=loss.iloc[1:15].mean()
+              avg_gain.iloc[14]=gain.iloc[1:15].mean(); avg_loss.iloc[14]=loss.iloc[1:15].mean()
               for i in range(15,len(h)):
                   avg_gain.iloc[i]=(avg_gain.iloc[i-1]*13+gain.iloc[i])/14
                   avg_loss.iloc[i]=(avg_loss.iloc[i-1]*13+loss.iloc[i])/14
-          rs=avg_gain/avg_loss
-          h['rsi']=100-(100/(1+rs))
+          rs=avg_gain/avg_loss; h['rsi']=100-(100/(1+rs))
 
-          trades=[]
-          pos=None
-          pending=None
-          # Signal candle closes; entry is next 1H candle open.
-          for i in range(15,len(h)-1):
-              r=h.rsi.iloc[i]; rp=h.rsi.iloc[i-1]
+          trades=[]; pos=None; pending=None; i=15
+          while i < len(h)-1:
               if pos is None and pending is None:
-                  if rp<=55 and r>55:
-                      pending=('LONG', i, float(h.low.iloc[i]))
-                  elif rp>=45 and r<45:
-                      pending=('SHORT', i, float(h.high.iloc[i]))
-              if pending is not None and i+1 < len(h):
-                  side, sig_i, stop=pending
-                  entry_i=i+1
-                  entry=float(h.open.iloc[entry_i])
-                  # Gap through stop: fill at next open.
+                  if h.rsi.iloc[i-1] <= 55 and h.rsi.iloc[i] > 55:
+                      pending=('LONG',i,float(h.low.iloc[i]))
+                  elif h.rsi.iloc[i-1] >= 45 and h.rsi.iloc[i] < 45:
+                      pending=('SHORT',i,float(h.high.iloc[i]))
+              if pending is not None:
+                  side,sig_i,stop=pending; entry_i=i+1; entry=float(h.open.iloc[entry_i]); pending=None
                   if (side=='LONG' and entry<=stop) or (side=='SHORT' and entry>=stop):
                       exitp=entry; reason='gap_stop_at_entry'; exit_i=entry_i
                       pnl=(exitp-entry) if side=='LONG' else (entry-exitp)
-                      trades.append([h.dt.iloc[sig_i],h.dt.iloc[entry_i],h.dt.iloc[entry_i],side,entry,exitp,pnl,reason])
-                      pending=None; pos=None
-                  else:
-                      pos={'side':side,'sig_i':sig_i,'entry_i':entry_i,'entry':entry,'stop':stop}
-                      pending=None
-
+                      trades.append([h.dt.iloc[sig_i],h.dt.iloc[entry_i],h.dt.iloc[exit_i],side,entry,exitp,pnl,reason]); i+=1; continue
+                  pos={'side':side,'sig_i':sig_i,'entry_i':entry_i,'entry':entry,'stop':stop}
               if pos is not None and i>=pos['entry_i']:
-                  side=pos['side']; stop=pos['stop']
-                  barlow=float(h.low.iloc[i]); barhigh=float(h.high.iloc[i])
-                  hit=(barlow<=stop) if side=='LONG' else (barhigh>=stop)
+                  side=pos['side']; stop=pos['stop']; hit=(float(h.low.iloc[i])<=stop) if side=='LONG' else (float(h.high.iloc[i])>=stop)
                   if hit:
                       exitp=stop; reason='price_stop'; exit_i=i
+                  elif side=='LONG' and h.rsi.iloc[i-1]>=55 and h.rsi.iloc[i]<55:
+                      if i+1>=len(h): break
+                      exitp=float(h.open.iloc[i+1]); reason='rsi_exit'; exit_i=i+1
+                  elif side=='SHORT' and h.rsi.iloc[i-1]<=45 and h.rsi.iloc[i]>45:
+                      if i+1>=len(h): break
+                      exitp=float(h.open.iloc[i+1]); reason='rsi_exit'; exit_i=i+1
                   else:
-                      # RSI cross is confirmed only at 1H close; market exit next 1H open.
-                      if i>0:
-                          if side=='LONG' and h.rsi.iloc[i-1]>=55 and h.rsi.iloc[i]<55:
-                              if i+1 < len(h):
-                                  exitp=float(h.open.iloc[i+1]); reason='rsi_exit'; exit_i=i+1
-                              else: continue
-                          elif side=='SHORT' and h.rsi.iloc[i-1]<=45 and h.rsi.iloc[i]>45:
-                              if i+1 < len(h):
-                                  exitp=float(h.open.iloc[i+1]); reason='rsi_exit'; exit_i=i+1
-                              else: continue
-                          else:
-                              continue
-                          pnl=(exitp-pos['entry']) if side=='LONG' else (pos['entry']-exitp)
-                          trades.append([h.dt.iloc[pos['sig_i']],h.dt.iloc[pos['entry_i']],h.dt.iloc[exit_i],side,pos['entry'],exitp,pnl,reason])
-                          pos=None
-                          continue
-                      else:
-                          continue
+                      i+=1; continue
                   pnl=(exitp-pos['entry']) if side=='LONG' else (pos['entry']-exitp)
-                  trades.append([h.dt.iloc[pos['sig_i']],h.dt.iloc[pos['entry_i']],h.dt.iloc[exit_i],side,pos['entry'],exitp,pnl,reason])
-                  pos=None
+                  trades.append([h.dt.iloc[pos['sig_i']],h.dt.iloc[pos['entry_i']],h.dt.iloc[exit_i],side,pos['entry'],exitp,pnl,reason]); pos=None
+              i+=1
 
-          t=pd.DataFrame(trades, columns=['signal_time','entry_time','exit_time','side','entry','exit','points','reason'])
+          t=pd.DataFrame(trades,columns=['signal_time','entry_time','exit_time','side','entry','exit','points','reason'])
           if len(t):
-              t['year']=pd.to_datetime(t.entry_time).dt.year
-              t['cum_points']=t.points.cumsum()
-              t['equity_peak']=t.cum_points.cummax()
-              t['drawdown']=t.cum_points-t.equity_peak
-              wins=t[t.points>0]; losses=t[t.points<0]
-              pf=wins.points.sum()/abs(losses.points.sum()) if len(losses) and losses.points.sum()!=0 else math.inf
-              summary={
-                  'data_start':str(m.dt.min()), 'data_end':str(m.dt.max()), 'minute_rows':len(m), 'hourly_bars':len(h),
-                  'trades':len(t), 'wins':len(wins), 'losses':len(losses), 'win_rate_pct':100*len(wins)/len(t),
-                  'profit_factor':pf, 'net_points':t.points.sum(), 'avg_trade_points':t.points.mean(),
-                  'median_trade_points':t.points.median(), 'max_drawdown_points':t.drawdown.min(),
-                  'long_trades':int((t.side=='LONG').sum()), 'short_trades':int((t.side=='SHORT').sum()),
-                  'long_points':t.loc[t.side=='LONG','points'].sum(), 'short_points':t.loc[t.side=='SHORT','points'].sum(),
-                  'stop_exits':int((t.reason.str.contains('stop')).sum()), 'rsi_exits':int((t.reason=='rsi_exit').sum())
-              }
-              # losing streak
-              streak=cur=0
-              for x in t.points:
-                  cur=cur+1 if x<0 else 0
-                  streak=max(streak,cur)
-              summary['max_losing_streak']=streak
-              yearly=t.groupby('year').agg(trades=('points','size'), win_rate_pct=('points',lambda x:100*(x>0).mean()), net_points=('points','sum'), avg_points=('points','mean')).reset_index()
+              t['year']=pd.to_datetime(t.entry_time).dt.year; t['cum_points']=t.points.cumsum(); t['equity_peak']=t.cum_points.cummax(); t['drawdown']=t.cum_points-t.equity_peak
+              wins=t[t.points>0]; losses=t[t.points<0]; pf=wins.points.sum()/abs(losses.points.sum()) if len(losses) else math.inf
+              cur=streak=0
+              for x in t.points: cur=cur+1 if x<0 else 0; streak=max(streak,cur)
+              summary={'data_start':str(m.dt.min()),'data_end':str(m.dt.max()),'minute_rows':len(m),'hourly_bars':len(h),'trades':len(t),'wins':len(wins),'losses':len(losses),'win_rate_pct':100*len(wins)/len(t),'profit_factor':pf,'net_points':t.points.sum(),'avg_trade_points':t.points.mean(),'median_trade_points':t.points.median(),'max_drawdown_points':t.drawdown.min(),'long_trades':int((t.side=='LONG').sum()),'short_trades':int((t.side=='SHORT').sum()),'long_points':t.loc[t.side=='LONG','points'].sum(),'short_points':t.loc[t.side=='SHORT','points'].sum(),'stop_exits':int(t.reason.str.contains('stop').sum()),'rsi_exits':int((t.reason=='rsi_exit').sum()),'max_losing_streak':streak}
+              yearly=t.groupby('year').agg(trades=('points','size'),win_rate_pct=('points',lambda x:100*(x>0).mean()),net_points=('points','sum'),avg_points=('points','mean')).reset_index()
           else:
-              summary={'data_start':str(m.dt.min()),'data_end':str(m.dt.max()),'minute_rows':len(m),'hourly_bars':len(h),'trades':0}
-              yearly=pd.DataFrame()
+              summary={'data_start':str(m.dt.min()),'data_end':str(m.dt.max()),'minute_rows':len(m),'hourly_bars':len(h),'trades':0}; yearly=pd.DataFrame()
 
-          os.makedirs('backtest_results',exist_ok=True)
-          pd.DataFrame([summary]).to_csv('backtest_results/summary.csv',index=False)
-          t.to_csv('backtest_results/trades.csv',index=False)
-          yearly.to_csv('backtest_results/yearly.csv',index=False)
+          os.makedirs('backtest_results',exist_ok=True); pd.DataFrame([summary]).to_csv('backtest_results/summary.csv',index=False); t.to_csv('backtest_results/trades.csv',index=False); yearly.to_csv('backtest_results/yearly.csv',index=False)
           with open('backtest_results/REPORT.md','w') as f:
-              f.write('# NIFTY 50 Futures RSI(14) 55/45 Backtest\n\n')
-              f.write('Rules: 1H candles anchored at 09:15; RSI(14); long cross above 55; short cross below 45; entry next 1H open; signal-candle low/high stop; RSI exit on confirmed cross, filled next 1H open; price stop takes priority if touched before the RSI-confirmed exit; gap-through-stop filled at entry open.\n\n')
+              f.write('# NIFTY 50 Futures RSI(14) 55/45 Backtest\n\nRules: 1H candles anchored at 09:15; RSI(14); long cross above 55; short cross below 45; entry next 1H open; signal-candle low/high stop; RSI exit on confirmed cross, filled next 1H open; price stop takes priority when touched before RSI-confirmed exit; gap-through-stop filled at next open.\n\n')
               for k,v in summary.items(): f.write(f'- **{k}**: {v}\n')
-              if len(yearly):
-                  f.write('\n## Yearly\n\n'+yearly.to_markdown(index=False)+'\n')
-          print(pd.DataFrame([summary]).to_string(index=False))
-          print(yearly.to_string(index=False) if len(yearly) else 'No trades')
+              if len(yearly): f.write('\n## Yearly\n\n'+yearly.to_markdown(index=False)+'\n')
+          print(pd.DataFrame([summary]).to_string(index=False)); print(yearly.to_string(index=False) if len(yearly) else 'No trades')
           PY
           python -m pip install pandas numpy tabulate -q
           python /tmp/backtest.py
@@ -187,6 +130,6 @@ jobs:
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add backtest_results
+          git add --sparse backtest_results
           git commit -m 'Add NIFTY RSI 55/45 backtest results' || echo 'No changes to commit'
           git push
