@@ -85,11 +85,9 @@ jobs:
           python -m pip install pandas numpy tabulate -q
           python /tmp/backtest.py
 
-      - name: Commit results to repository
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git sparse-checkout disable
-          git add backtest_results/REPORT.md backtest_results/summary.csv backtest_results/trades.csv backtest_results/yearly.csv
-          git commit -m 'Add NIFTY RSI 55/45 backtest results' || echo 'No changes to commit'
-          git push
+      - name: Upload backtest results
+        uses: actions/upload-artifact@v4
+        with:
+          name: nifty-rsi-backtest-results
+          path: backtest_results/
+          retention-days: 30
