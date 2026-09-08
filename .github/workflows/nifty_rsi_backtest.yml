@@ -36,6 +36,8 @@ jobs:
           import glob, os, math
           import pandas as pd
           import numpy as np
+
+          LOT_SIZE = 50  # NIFTY lot size throughout this 2012-Feb-2023 test period
           files=glob.glob('**/NIFTY_F1.txt',recursive=True)
           cols=['symbol','date','time','open','high','low','close','volume','oi']; frames=[]
           for f in files:
@@ -54,6 +56,7 @@ jobs:
               ag.iloc[14]=gain.iloc[1:15].mean(); al.iloc[14]=loss.iloc[1:15].mean()
               for i in range(15,len(h)): ag.iloc[i]=(ag.iloc[i-1]*13+gain.iloc[i])/14; al.iloc[i]=(al.iloc[i-1]*13+loss.iloc[i])/14
           h['rsi']=100-100/(1+ag/al)
+
           trades=[]; pos=None; pending=None; i=15
           while i<len(h)-1:
               if pos is None and pending is None:
@@ -72,15 +75,41 @@ jobs:
                   else: i+=1; continue
                   pnl=xp-pos['entry'] if side=='LONG' else pos['entry']-xp; trades.append([h.dt.iloc[pos['si']],h.dt.iloc[pos['ei']],h.dt.iloc[xi],side,pos['entry'],xp,pnl,reason]); pos=None
               i+=1
+
           t=pd.DataFrame(trades,columns=['signal_time','entry_time','exit_time','side','entry','exit','points','reason']); os.makedirs('backtest_results',exist_ok=True)
           if len(t):
-              t['year']=pd.to_datetime(t.entry_time).dt.year; t['cum_points']=t.points.cumsum(); t['equity_peak']=t.cum_points.cummax(); t['drawdown']=t.cum_points-t.equity_peak; wins=t[t.points>0]; losses=t[t.points<0]; pf=wins.points.sum()/abs(losses.points.sum()) if len(losses) else math.inf; cur=streak=0
+              t['year']=pd.to_datetime(t.entry_time).dt.year
+              t['gross_pnl_rs']=t.points*LOT_SIZE
+              t['turnover_rs']=(t.entry+t.exit)*LOT_SIZE
+              t['cum_points']=t.points.cumsum(); t['equity_peak']=t.cum_points.cummax(); t['drawdown']=t.cum_points-t.equity_peak
+              wins=t[t.points>0]; losses=t[t.points<0]; pf=wins.points.sum()/abs(losses.points.sum()) if len(losses) else math.inf; cur=streak=0
               for x in t.points: cur=cur+1 if x<0 else 0; streak=max(streak,cur)
-              s={'data_start':str(m.dt.min()),'data_end':str(m.dt.max()),'minute_rows':len(m),'hourly_bars':len(h),'trades':len(t),'wins':len(wins),'losses':len(losses),'win_rate_pct':100*len(wins)/len(t),'profit_factor':pf,'net_points':t.points.sum(),'avg_trade_points':t.points.mean(),'median_trade_points':t.points.median(),'max_drawdown_points':t.drawdown.min(),'long_trades':int((t.side=='LONG').sum()),'short_trades':int((t.side=='SHORT').sum()),'long_points':t.loc[t.side=='LONG','points'].sum(),'short_points':t.loc[t.side=='SHORT','points'].sum(),'stop_exits':int(t.reason.str.contains('stop').sum()),'rsi_exits':int((t.reason=='rsi_exit').sum()),'max_losing_streak':streak}; y=t.groupby('year').agg(trades=('points','size'),win_rate_pct=('points',lambda x:100*(x>0).mean()),net_points=('points','sum'),avg_points=('points','mean')).reset_index()
-          else: s={'data_start':str(m.dt.min()),'data_end':str(m.dt.max()),'minute_rows':len(m),'hourly_bars':len(h),'trades':0}; y=pd.DataFrame()
-          pd.DataFrame([s]).to_csv('backtest_results/summary.csv',index=False); t.to_csv('backtest_results/trades.csv',index=False); y.to_csv('backtest_results/yearly.csv',index=False)
-          with open('backtest_results/REPORT.md','w') as f: f.write('# NIFTY 50 Futures RSI(14) 55/45 Backtest\n\nRules: 1H candles anchored at 09:15; RSI(14); long cross above 55; short cross below 45; entry next 1H open; signal-candle low/high stop; RSI exit on confirmed cross, filled next 1H open; price stop takes priority; gap-through-stop filled at next open.\n\n'); [f.write(f'- **{k}**: {v}\n') for k,v in s.items()]; f.write('\n## Yearly\n\n'); f.write(y.to_markdown(index=False) if len(y) else 'No trades')
-          print(pd.DataFrame([s]).to_string(index=False)); print(y.to_string(index=False) if len(y) else 'No trades')
+              avg_win=wins.points.mean() if len(wins) else 0; avg_loss=losses.points.mean() if len(losses) else 0
+              s={'data_start':str(m.dt.min()),'data_end':str(m.dt.max()),'minute_rows':len(m),'hourly_bars':len(h),'trades':len(t),'wins':len(wins),'losses':len(losses),'win_rate_pct':100*len(wins)/len(t),'profit_factor':pf,'net_points':t.points.sum(),'gross_pnl_rs':t.gross_pnl_rs.sum(),'avg_trade_points':t.points.mean(),'avg_trade_rs':t.gross_pnl_rs.mean(),'median_trade_points':t.points.median(),'max_drawdown_points':t.drawdown.min(),'max_drawdown_rs':t.drawdown.min()*LOT_SIZE,'long_trades':int((t.side=='LONG').sum()),'short_trades':int((t.side=='SHORT').sum()),'long_points':t.loc[t.side=='LONG','points'].sum(),'short_points':t.loc[t.side=='SHORT','points'].sum(),'stop_exits':int(t.reason.str.contains('stop').sum()),'rsi_exits':int((t.reason=='rsi_exit').sum()),'max_losing_streak':streak,'avg_win_points':avg_win,'avg_loss_points':avg_loss,'expectancy_points':t.points.mean()}
+              y=t.groupby('year').agg(trades=('points','size'),win_rate_pct=('points',lambda x:100*(x>0).mean()),net_points=('points','sum'),avg_points=('points','mean')).reset_index(); y['gross_pnl_rs']=y.net_points*LOT_SIZE
+
+              # Cost sensitivity: all-in percentage of round-trip futures turnover.
+              # 0.0125% is a historical approximate cost assumption; 0.02% and 0.03% are stress cases.
+              scenarios=[]
+              for rate in [0.0,0.000125,0.00020,0.00030]:
+                  cost=(t.turnover_rs*rate).sum(); net=t.gross_pnl_rs.sum()-cost
+                  dd_series=(t.gross_pnl_rs - t.turnover_rs*rate).cumsum(); dd=(dd_series-dd_series.cummax()).min()
+                  scenarios.append({'cost_rate_pct':rate*100,'gross_pnl_rs':t.gross_pnl_rs.sum(),'estimated_cost_rs':cost,'net_pnl_rs':net,'net_pnl_per_trade_rs':net/len(t),'max_drawdown_rs':dd})
+              costs=pd.DataFrame(scenarios)
+
+              # Illustrative returns on fixed starting capital; this is NOT historical margin.
+              for cap in [200000,500000,1000000]: costs[f'return_on_{cap}_pct']=100*costs.net_pnl_rs/cap
+          else:
+              s={'data_start':str(m.dt.min()),'data_end':str(m.dt.max()),'minute_rows':len(m),'hourly_bars':len(h),'trades':0}; y=pd.DataFrame(); costs=pd.DataFrame()
+
+          pd.DataFrame([s]).to_csv('backtest_results/summary.csv',index=False); t.to_csv('backtest_results/trades.csv',index=False); y.to_csv('backtest_results/yearly.csv',index=False); costs.to_csv('backtest_results/cost_sensitivity.csv',index=False)
+          with open('backtest_results/REPORT.md','w') as f:
+              f.write('# NIFTY 50 Futures RSI(14) 55/45 Backtest\n\n')
+              f.write('Rules: 1H candles anchored at 09:15; RSI(14); long cross above 55; short cross below 45; entry next 1H open; signal-candle low/high stop; RSI exit on confirmed cross, filled next 1H open; price stop takes priority; gap-through-stop filled at next open. NIFTY lot size assumed 50 for the test period.\n\n')
+              f.write('## Core results\n\n'); [f.write(f'- **{k}**: {v}\n') for k,v in s.items()]
+              f.write('\n## Cost sensitivity\n\n'); f.write(costs.to_markdown(index=False) if len(costs) else 'No trades')
+              f.write('\n\n## Yearly\n\n'); f.write(y.to_markdown(index=False) if len(y) else 'No trades')
+          print(pd.DataFrame([s]).to_string(index=False)); print('\nCOST SENSITIVITY\n',costs.to_string(index=False)); print('\nYEARLY\n',y.to_string(index=False) if len(y) else 'No trades')
           PY
           python -m pip install pandas numpy tabulate -q
           python /tmp/backtest.py
