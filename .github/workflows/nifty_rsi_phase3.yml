@@ -1,0 +1,125 @@
+name: NIFTY RSI Phase 3 - Long Only vs Long Short
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/nifty_rsi_phase3.yml'
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout only NIFTY_F1 data
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            2012/**/NIFTY_F1.txt
+            2013/**/NIFTY_F1.txt
+            2014/**/NIFTY_F1.txt
+            2015/**/NIFTY_F1.txt
+            2016/**/NIFTY_F1.txt
+            2017/**/NIFTY_F1.txt
+            2018/**/NIFTY_F1.txt
+            2019/**/NIFTY_F1.txt
+            2020/**/NIFTY_F1.txt
+            2021/**/NIFTY_F1.txt
+            2022/**/NIFTY_F1.txt
+            2023/**/NIFTY_F1.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Run Phase 3 analysis
+        shell: bash
+        run: |
+          cat > /tmp/phase3.py <<'PY'
+          import glob, os, math
+          import pandas as pd
+          import numpy as np
+
+          LOT_SIZE=50
+          files=glob.glob('**/NIFTY_F1.txt',recursive=True)
+          cols=['symbol','date','time','open','high','low','close','volume','oi']
+          frames=[]
+          for f in files:
+              try:
+                  d=pd.read_csv(f,header=None,names=cols)
+                  d['dt']=pd.to_datetime(d['date'].astype(str)+' '+d['time'].astype(str),format='%Y%m%d %H:%M',errors='coerce')
+                  for c in ['open','high','low','close']: d[c]=pd.to_numeric(d[c],errors='coerce')
+                  d=d.dropna(subset=['dt','open','high','low','close'])
+                  frames.append(d[['dt','open','high','low','close']])
+              except Exception as e: print('SKIP',f,e)
+          m=pd.concat(frames,ignore_index=True).drop_duplicates('dt').sort_values('dt').reset_index(drop=True)
+          m=m[(m.dt.dt.year>=2012)&(m.dt.dt.year<=2023)]
+          m['session_date']=m.dt.dt.date
+          m['mins']=m.dt.dt.hour*60+m.dt.dt.minute-555
+          m=m[(m.mins>=0)&(m.mins<=375)]
+          m['bucket']=(m.mins//60).astype(int)
+          h=(m.groupby(['session_date','bucket'],sort=True).agg(dt=('dt','max'),open=('open','first'),high=('high','max'),low=('low','min'),close=('close','last')).reset_index().sort_values('dt').reset_index(drop=True))
+          delta=h.close.diff(); gain=delta.clip(lower=0); loss=-delta.clip(upper=0)
+          ag=pd.Series(np.nan,index=h.index); al=pd.Series(np.nan,index=h.index)
+          if len(h)>14:
+              ag.iloc[14]=gain.iloc[1:15].mean(); al.iloc[14]=loss.iloc[1:15].mean()
+              for i in range(15,len(h)):
+                  ag.iloc[i]=(ag.iloc[i-1]*13+gain.iloc[i])/14
+                  al.iloc[i]=(al.iloc[i-1]*13+loss.iloc[i])/14
+          h['rsi']=100-100/(1+ag/al)
+
+          def run_variant(name, allow_long=True, allow_short=True):
+              trades=[]; pos=None; pending=None; i=15
+              while i<len(h)-1:
+                  if pos is None and pending is None:
+                      if allow_long and h.rsi.iloc[i-1]<=55 and h.rsi.iloc[i]>55:
+                          pending=('LONG',i,float(h.low.iloc[i]))
+                      elif allow_short and h.rsi.iloc[i-1]>=45 and h.rsi.iloc[i]<45:
+                          pending=('SHORT',i,float(h.high.iloc[i]))
+                  if pending:
+                      side,si,stop=pending; ei=i+1; entry=float(h.open.iloc[ei]); pending=None
+                      if (side=='LONG' and entry<=stop) or (side=='SHORT' and entry>=stop):
+                          trades.append([h.dt.iloc[si],h.dt.iloc[ei],h.dt.iloc[ei],side,entry,entry,0,'gap_stop_at_entry']); i+=1; continue
+                      pos={'side':side,'si':si,'ei':ei,'entry':entry,'stop':stop}
+                  if pos and i>=pos['ei']:
+                      side=pos['side']; stop=pos['stop']
+                      hit=(float(h.low.iloc[i])<=stop) if side=='LONG' else (float(h.high.iloc[i])>=stop)
+                      if hit: xp=stop; reason='price_stop'; xi=i
+                      elif side=='LONG' and h.rsi.iloc[i-1]>=55 and h.rsi.iloc[i]<55: xp=float(h.open.iloc[i+1]); reason='rsi_exit'; xi=i+1
+                      elif side=='SHORT' and h.rsi.iloc[i-1]<=45 and h.rsi.iloc[i]>45: xp=float(h.open.iloc[i+1]); reason='rsi_exit'; xi=i+1
+                      else: i+=1; continue
+                      pnl=xp-pos['entry'] if side=='LONG' else pos['entry']-xp
+                      trades.append([h.dt.iloc[pos['si']],h.dt.iloc[pos['ei']],h.dt.iloc[xi],side,pos['entry'],xp,pnl,reason]); pos=None
+                  i+=1
+              t=pd.DataFrame(trades,columns=['signal_time','entry_time','exit_time','side','entry','exit','points','reason'])
+              if t.empty: return {'variant':name,'trades':0}
+              t['year']=pd.to_datetime(t.entry_time).dt.year; t['gross_pnl_rs']=t.points*LOT_SIZE
+              wins=t[t.points>0]; losses=t[t.points<0]
+              pf=wins.points.sum()/abs(losses.points.sum()) if len(losses) else math.inf
+              eq=t.points.cumsum(); dd=eq-eq.cummax()
+              streak=cur=0
+              for x in t.points:
+                  cur=cur+1 if x<0 else 0; streak=max(streak,cur)
+              turnover=((t.entry+t.exit)*LOT_SIZE).sum(); cost=turnover*0.00020
+              net=t.gross_pnl_rs.sum()-cost
+              ne=(t.gross_pnl_rs-(t.entry+t.exit)*LOT_SIZE*0.00020).cumsum(); netdd=(ne-ne.cummax()).min()
+              return {'variant':name,'trades':len(t),'win_rate_pct':100*len(wins)/len(t),'profit_factor':pf,'net_points':t.points.sum(),'gross_pnl_rs':t.gross_pnl_rs.sum(),'estimated_cost_rs':cost,'net_pnl_rs_0.02pct':net,'avg_trade_rs_0.02pct':net/len(t),'max_drawdown_points':dd.min(),'max_drawdown_rs':dd.min()*LOT_SIZE,'max_drawdown_rs_0.02pct':netdd,'long_trades':int((t.side=='LONG').sum()),'short_trades':int((t.side=='SHORT').sum()),'long_points':t.loc[t.side=='LONG','points'].sum(),'short_points':t.loc[t.side=='SHORT','points'].sum(),'max_losing_streak':streak,'avg_win_points':wins.points.mean(),'avg_loss_points':losses.points.mean() if len(losses) else 0}
+
+          results=pd.DataFrame([run_variant('LONG + SHORT',True,True),run_variant('LONG ONLY',True,False),run_variant('SHORT ONLY',False,True)])
+          os.makedirs('phase3_results',exist_ok=True)
+          results.to_csv('phase3_results/phase3_comparison.csv',index=False)
+          results.to_markdown('phase3_results/PHASE3_REPORT.md',index=False)
+          with open('phase3_results/PHASE3_REPORT.md','a') as f:
+              f.write('\n\n## Interpretation\n')
+              f.write('- All variants use the original RSI(14) 55/45 rules and signal-candle high/low stop.\n')
+              f.write('- Entries are next 1H open and RSI exits are filled at the following 1H open.\n')
+              f.write('- Price stop has priority when a candle touches both stop and RSI exit conditions.\n')
+              f.write('- Net P&L and drawdown at 0.02% are illustrative transaction-cost sensitivity, not a broker-specific statement.\n')
+          print(results.to_string(index=False))
+          PY
+          python -m pip install pandas numpy tabulate -q
+          python /tmp/phase3.py
+
+      - name: Upload Phase 3 results
+        uses: actions/upload-artifact@v4
+        with:
+          name: nifty-rsi-phase3-results
+          path: phase3_results/
+          retention-days: 30
