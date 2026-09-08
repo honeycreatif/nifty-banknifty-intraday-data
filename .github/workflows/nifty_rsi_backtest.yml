@@ -36,92 +36,54 @@ jobs:
           import glob, os, math
           import pandas as pd
           import numpy as np
-
-          files = glob.glob('**/NIFTY_F1.txt', recursive=True)
-          files = [f for f in files if any(f.startswith(str(y) + '/') for y in range(2012, 2024))]
-          if not files:
-              raise SystemExit('No NIFTY_F1 files found')
-
-          cols=['symbol','date','time','open','high','low','close','volume','oi']
-          frames=[]
+          files=glob.glob('**/NIFTY_F1.txt',recursive=True)
+          cols=['symbol','date','time','open','high','low','close','volume','oi']; frames=[]
           for f in files:
               try:
-                  df=pd.read_csv(f, header=None, names=cols)
-                  df['dt']=pd.to_datetime(df['date'].astype(str)+' '+df['time'].astype(str), format='%Y%m%d %H:%M', errors='coerce')
-                  df=df.dropna(subset=['dt'])
-                  for c in ['open','high','low','close']:
-                      df[c]=pd.to_numeric(df[c], errors='coerce')
-                  df=df.dropna(subset=['open','high','low','close'])[['dt','open','high','low','close']]
-                  frames.append(df)
-              except Exception as e:
-                  print('SKIP',f,e)
-
-          m=pd.concat(frames, ignore_index=True).drop_duplicates('dt').sort_values('dt').reset_index(drop=True)
-          m=m[(m.dt.dt.year>=2012)&(m.dt.dt.year<=2023)]
-          m['session_date']=m.dt.dt.date
-          m['mins']=(m.dt.dt.hour*60+m.dt.dt.minute)-555
-          m=m[(m.mins>=0)&(m.mins<=375)]
-          m['bucket']=(m.mins//60).astype(int)
-          h=(m.groupby(['session_date','bucket'], sort=True)
-               .agg(dt=('dt','max'), open=('open','first'), high=('high','max'), low=('low','min'), close=('close','last'), n=('close','size'))
-               .reset_index().sort_values('dt').reset_index(drop=True))
-
-          delta=h.close.diff(); gain=delta.clip(lower=0); loss=(-delta.clip(upper=0))
-          avg_gain=pd.Series(np.nan,index=h.index,dtype=float); avg_loss=pd.Series(np.nan,index=h.index,dtype=float)
+                  d=pd.read_csv(f,header=None,names=cols)
+                  d['dt']=pd.to_datetime(d['date'].astype(str)+' '+d['time'].astype(str),format='%Y%m%d %H:%M',errors='coerce')
+                  d=d.dropna(subset=['dt'])
+                  for c in ['open','high','low','close']: d[c]=pd.to_numeric(d[c],errors='coerce')
+                  frames.append(d.dropna(subset=['open','high','low','close'])[['dt','open','high','low','close']])
+              except Exception as e: print('SKIP',f,e)
+          m=pd.concat(frames,ignore_index=True).drop_duplicates('dt').sort_values('dt').reset_index(drop=True)
+          m=m[(m.dt.dt.year>=2012)&(m.dt.dt.year<=2023)]; m['session_date']=m.dt.dt.date; m['mins']=m.dt.dt.hour*60+m.dt.dt.minute-555; m=m[(m.mins>=0)&(m.mins<=375)]; m['bucket']=(m.mins//60).astype(int)
+          h=(m.groupby(['session_date','bucket'],sort=True).agg(dt=('dt','max'),open=('open','first'),high=('high','max'),low=('low','min'),close=('close','last'),n=('close','size')).reset_index().sort_values('dt').reset_index(drop=True))
+          delta=h.close.diff(); gain=delta.clip(lower=0); loss=-delta.clip(upper=0); ag=pd.Series(np.nan,index=h.index); al=pd.Series(np.nan,index=h.index)
           if len(h)>14:
-              avg_gain.iloc[14]=gain.iloc[1:15].mean(); avg_loss.iloc[14]=loss.iloc[1:15].mean()
-              for i in range(15,len(h)):
-                  avg_gain.iloc[i]=(avg_gain.iloc[i-1]*13+gain.iloc[i])/14
-                  avg_loss.iloc[i]=(avg_loss.iloc[i-1]*13+loss.iloc[i])/14
-          rs=avg_gain/avg_loss; h['rsi']=100-(100/(1+rs))
-
+              ag.iloc[14]=gain.iloc[1:15].mean(); al.iloc[14]=loss.iloc[1:15].mean()
+              for i in range(15,len(h)): ag.iloc[i]=(ag.iloc[i-1]*13+gain.iloc[i])/14; al.iloc[i]=(al.iloc[i-1]*13+loss.iloc[i])/14
+          h['rsi']=100-100/(1+ag/al)
           trades=[]; pos=None; pending=None; i=15
-          while i < len(h)-1:
+          while i<len(h)-1:
               if pos is None and pending is None:
-                  if h.rsi.iloc[i-1] <= 55 and h.rsi.iloc[i] > 55:
-                      pending=('LONG',i,float(h.low.iloc[i]))
-                  elif h.rsi.iloc[i-1] >= 45 and h.rsi.iloc[i] < 45:
-                      pending=('SHORT',i,float(h.high.iloc[i]))
-              if pending is not None:
-                  side,sig_i,stop=pending; entry_i=i+1; entry=float(h.open.iloc[entry_i]); pending=None
+                  if h.rsi.iloc[i-1]<=55 and h.rsi.iloc[i]>55: pending=('LONG',i,float(h.low.iloc[i]))
+                  elif h.rsi.iloc[i-1]>=45 and h.rsi.iloc[i]<45: pending=('SHORT',i,float(h.high.iloc[i]))
+              if pending:
+                  side,si,stop=pending; ei=i+1; entry=float(h.open.iloc[ei]); pending=None
                   if (side=='LONG' and entry<=stop) or (side=='SHORT' and entry>=stop):
-                      exitp=entry; reason='gap_stop_at_entry'; exit_i=entry_i
-                      pnl=(exitp-entry) if side=='LONG' else (entry-exitp)
-                      trades.append([h.dt.iloc[sig_i],h.dt.iloc[entry_i],h.dt.iloc[exit_i],side,entry,exitp,pnl,reason]); i+=1; continue
-                  pos={'side':side,'sig_i':sig_i,'entry_i':entry_i,'entry':entry,'stop':stop}
-              if pos is not None and i>=pos['entry_i']:
+                      trades.append([h.dt.iloc[si],h.dt.iloc[ei],h.dt.iloc[ei],side,entry,entry,0,'gap_stop_at_entry']); i+=1; continue
+                  pos={'side':side,'si':si,'ei':ei,'entry':entry,'stop':stop}
+              if pos and i>=pos['ei']:
                   side=pos['side']; stop=pos['stop']; hit=(float(h.low.iloc[i])<=stop) if side=='LONG' else (float(h.high.iloc[i])>=stop)
-                  if hit:
-                      exitp=stop; reason='price_stop'; exit_i=i
-                  elif side=='LONG' and h.rsi.iloc[i-1]>=55 and h.rsi.iloc[i]<55:
-                      if i+1>=len(h): break
-                      exitp=float(h.open.iloc[i+1]); reason='rsi_exit'; exit_i=i+1
-                  elif side=='SHORT' and h.rsi.iloc[i-1]<=45 and h.rsi.iloc[i]>45:
-                      if i+1>=len(h): break
-                      exitp=float(h.open.iloc[i+1]); reason='rsi_exit'; exit_i=i+1
-                  else:
-                      i+=1; continue
-                  pnl=(exitp-pos['entry']) if side=='LONG' else (pos['entry']-exitp)
-                  trades.append([h.dt.iloc[pos['sig_i']],h.dt.iloc[pos['entry_i']],h.dt.iloc[exit_i],side,pos['entry'],exitp,pnl,reason]); pos=None
+                  if hit: xp=stop; reason='price_stop'; xi=i
+                  elif side=='LONG' and h.rsi.iloc[i-1]>=55 and h.rsi.iloc[i]<55: xp=float(h.open.iloc[i+1]); reason='rsi_exit'; xi=i+1
+                  elif side=='SHORT' and h.rsi.iloc[i-1]<=45 and h.rsi.iloc[i]>45: xp=float(h.open.iloc[i+1]); reason='rsi_exit'; xi=i+1
+                  else: i+=1; continue
+                  pnl=xp-pos['entry'] if side=='LONG' else pos['entry']-xp; trades.append([h.dt.iloc[pos['si']],h.dt.iloc[pos['ei']],h.dt.iloc[xi],side,pos['entry'],xp,pnl,reason]); pos=None
               i+=1
-
           t=pd.DataFrame(trades,columns=['signal_time','entry_time','exit_time','side','entry','exit','points','reason'])
+          os.makedirs('backtest_results',exist_ok=True)
           if len(t):
-              t['year']=pd.to_datetime(t.entry_time).dt.year; t['cum_points']=t.points.cumsum(); t['equity_peak']=t.cum_points.cummax(); t['drawdown']=t.cum_points-t.equity_peak
-              wins=t[t.points>0]; losses=t[t.points<0]; pf=wins.points.sum()/abs(losses.points.sum()) if len(losses) else math.inf
-              cur=streak=0
+              t['year']=pd.to_datetime(t.entry_time).dt.year; t['cum_points']=t.points.cumsum(); t['equity_peak']=t.cum_points.cummax(); t['drawdown']=t.cum_points-t.equity_peak; wins=t[t.points>0]; losses=t[t.points<0]; pf=wins.points.sum()/abs(losses.points.sum()) if len(losses) else math.inf; cur=streak=0
               for x in t.points: cur=cur+1 if x<0 else 0; streak=max(streak,cur)
-              summary={'data_start':str(m.dt.min()),'data_end':str(m.dt.max()),'minute_rows':len(m),'hourly_bars':len(h),'trades':len(t),'wins':len(wins),'losses':len(losses),'win_rate_pct':100*len(wins)/len(t),'profit_factor':pf,'net_points':t.points.sum(),'avg_trade_points':t.points.mean(),'median_trade_points':t.points.median(),'max_drawdown_points':t.drawdown.min(),'long_trades':int((t.side=='LONG').sum()),'short_trades':int((t.side=='SHORT').sum()),'long_points':t.loc[t.side=='LONG','points'].sum(),'short_points':t.loc[t.side=='SHORT','points'].sum(),'stop_exits':int(t.reason.str.contains('stop').sum()),'rsi_exits':int((t.reason=='rsi_exit').sum()),'max_losing_streak':streak}
-              yearly=t.groupby('year').agg(trades=('points','size'),win_rate_pct=('points',lambda x:100*(x>0).mean()),net_points=('points','sum'),avg_points=('points','mean')).reset_index()
-          else:
-              summary={'data_start':str(m.dt.min()),'data_end':str(m.dt.max()),'minute_rows':len(m),'hourly_bars':len(h),'trades':0}; yearly=pd.DataFrame()
-
-          os.makedirs('backtest_results',exist_ok=True); pd.DataFrame([summary]).to_csv('backtest_results/summary.csv',index=False); t.to_csv('backtest_results/trades.csv',index=False); yearly.to_csv('backtest_results/yearly.csv',index=False)
+              s={'data_start':str(m.dt.min()),'data_end':str(m.dt.max()),'minute_rows':len(m),'hourly_bars':len(h),'trades':len(t),'wins':len(wins),'losses':len(losses),'win_rate_pct':100*len(wins)/len(t),'profit_factor':pf,'net_points':t.points.sum(),'avg_trade_points':t.points.mean(),'median_trade_points':t.points.median(),'max_drawdown_points':t.drawdown.min(),'long_trades':int((t.side=='LONG').sum()),'short_trades':int((t.side=='SHORT').sum()),'long_points':t.loc[t.side=='LONG','points'].sum(),'short_points':t.loc[t.side=='SHORT','points'].sum(),'stop_exits':int(t.reason.str.contains('stop').sum()),'rsi_exits':int((t.reason=='rsi_exit').sum()),'max_losing_streak':streak}
+              y=t.groupby('year').agg(trades=('points','size'),win_rate_pct=('points',lambda x:100*(x>0).mean()),net_points=('points','sum'),avg_points=('points','mean')).reset_index()
+          else: s={'data_start':str(m.dt.min()),'data_end':str(m.dt.max()),'minute_rows':len(m),'hourly_bars':len(h),'trades':0}; y=pd.DataFrame()
+          pd.DataFrame([s]).to_csv('backtest_results/summary.csv',index=False); t.to_csv('backtest_results/trades.csv',index=False); y.to_csv('backtest_results/yearly.csv',index=False)
           with open('backtest_results/REPORT.md','w') as f:
-              f.write('# NIFTY 50 Futures RSI(14) 55/45 Backtest\n\nRules: 1H candles anchored at 09:15; RSI(14); long cross above 55; short cross below 45; entry next 1H open; signal-candle low/high stop; RSI exit on confirmed cross, filled next 1H open; price stop takes priority when touched before RSI-confirmed exit; gap-through-stop filled at next open.\n\n')
-              for k,v in summary.items(): f.write(f'- **{k}**: {v}\n')
-              if len(yearly): f.write('\n## Yearly\n\n'+yearly.to_markdown(index=False)+'\n')
-          print(pd.DataFrame([summary]).to_string(index=False)); print(yearly.to_string(index=False) if len(yearly) else 'No trades')
+              f.write('# NIFTY 50 Futures RSI(14) 55/45 Backtest\n\n'); [f.write(f'- **{k}**: {v}\n') for k,v in s.items()]; f.write('\n## Yearly\n\n'); f.write(y.to_markdown(index=False) if len(y) else 'No trades')
+          print(pd.DataFrame([s]).to_string(index=False)); print(y.to_string(index=False) if len(y) else 'No trades')
           PY
           python -m pip install pandas numpy tabulate -q
           python /tmp/backtest.py
@@ -130,6 +92,6 @@ jobs:
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add --sparse backtest_results
+          git add -f backtest_results/REPORT.md backtest_results/summary.csv backtest_results/trades.csv backtest_results/yearly.csv
           git commit -m 'Add NIFTY RSI 55/45 backtest results' || echo 'No changes to commit'
           git push
